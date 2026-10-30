@@ -1,0 +1,67 @@
+name: Build iPhone App
+"on":
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nitecast-ios-build
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+      - name: Generate Xcode project
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen generate --spec project.yml
+      - name: Test on iPhone simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIMULATOR_ID=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); candidates=[x for v in d["devices"].values() for x in v if x.get("isAvailable") and "iPhone" in x["name"]]; print(candidates[0]["udid"])')
+          xcodebuild test -project Nitecast.xcodeproj -scheme Nitecast \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -derivedDataPath build-tests CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath TestResults.xcresult
+      - name: Build iPhone app
+        run: |
+          xcodebuild build -project Nitecast.xcodeproj -scheme Nitecast \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: Package for Sideloadly
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package/Payload
+          ditto build-device/Build/Products/Release-iphoneos/Nitecast.app package/Payload/Nitecast.app
+          test -f package/Payload/Nitecast.app/Nitecast
+          plutil -lint package/Payload/Nitecast.app/Info.plist
+          codesign --remove-signature package/Payload/Nitecast.app 2>/dev/null || true
+          cd package
+          zip -qry ../Nitecast.ipa Payload
+      - name: Downloadable iPhone package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nitecast-iPhone-1.2.1-build-6
+          path: Nitecast.ipa
+          if-no-files-found: error
+          retention-days: 14
+      - name: Test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nitecast-iPhone-TestResults
+          path: TestResults.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
