@@ -240,7 +240,7 @@ struct FamilyWebView: UIViewRepresentable {
             loadedID = body["id"] as? String; expectedContentURL = url; pendingLoad = nil
         }
         func startTimer() {
-            castDialogObserver = NotificationCenter.default.addObserver(forName:kGCKUICastDialogDidHideNotification,object:nil,queue:.main) { [weak self] _ in
+            castDialogObserver = NotificationCenter.default.addObserver(forName:.gckuiCastDialogDidHide,object:nil,queue:.main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.dialogClosedAt = Date() }
             }
             timer = Timer.scheduledTimer(withTimeInterval:2,repeats:true) { [weak self] _ in
