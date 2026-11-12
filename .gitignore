@@ -1,0 +1,9 @@
+.DS_Store
+*.xcodeproj/
+build-tests/
+build-device/
+package/
+*.ipa
+*.xcresult/
+*.mobileprovision
+*.p12
