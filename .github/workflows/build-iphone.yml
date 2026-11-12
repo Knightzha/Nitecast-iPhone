@@ -2,7 +2,8 @@ name: Build iPhone App
 "on":
   workflow_dispatch:
   push:
-    branches: [codex/cast-autoplay-1.2.2]
+    branches: [main]
+    paths: ['Nitecast/**', 'NitecastTests/**', 'project.yml', '.github/workflows/build-iphone.yml']
 permissions:
   contents: read
 concurrency:
