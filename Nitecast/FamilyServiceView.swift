@@ -91,7 +91,7 @@ struct FamilyWebView: UIViewRepresentable {
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.allowsAirPlayForMediaPlayback = true
         configuration.userContentController.add(context.coordinator,name:"nitecast")
-        configuration.userContentController.addUserScript(WKUserScript(source:"window.nitecastNativeFeatures={castPicker:1,castFinished:1};",injectionTime:.atDocumentStart,forMainFrameOnly:true))
+        configuration.userContentController.addUserScript(WKUserScript(source:"window.nitecastNativeFeatures={castPicker:1,castFinished:1,castQueue:1};",injectionTime:.atDocumentStart,forMainFrameOnly:true))
         configuration.userContentController.addUserScript(WKUserScript(source:"var style=document.createElement('style');style.textContent='#playerDialog .volume-control{display:none}';document.head.appendChild(style);var viewport=document.querySelector('meta[name=viewport]');if(viewport)viewport.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover';",injectionTime:.atDocumentEnd,forMainFrameOnly:true))
         let view = WKWebView(frame:.zero,configuration:configuration)
         view.isOpaque = false; view.backgroundColor = .black
@@ -137,6 +137,9 @@ struct FamilyWebView: UIViewRepresentable {
         var observedMediaSessionID: Int?
         var observedDuration: Double = 0
         var sentCastFinished = false
+        var nextCast: (id:String,url:URL)?
+        var queueRequestID: Int?
+        var loadRequestID: Int?
         var offline: Binding<Bool>
         var playerPresented: Binding<Bool>
         var pendingChoiceID: String?
@@ -183,6 +186,30 @@ struct FamilyWebView: UIViewRepresentable {
                 else { presentTVPicker() }
             } else if action == "cancelCastChoice" {
                 pendingChoiceID = nil
+            } else if action == "queueNext", let id = body["id"] as? String {
+                guard body["parent"] as? String == loadedID, nextCast == nil,
+                      let raw = body["url"] as? String, let url = URL(string:raw),
+                      sameOrigin(url), url.path == "/watch-media/"+id,
+                      let remote = observedCastClient, remote.connected else {
+                    queueEvent(id,"failed"); return
+                }
+                let info = GCKMediaInformationBuilder(contentURL:url)
+                info.streamType = .buffered
+                info.contentType = body["mime"] as? String ?? "video/mp4"
+                let metadata = GCKMediaMetadata()
+                metadata.setString(body["title"] as? String ?? "Next episode",forKey:kGCKMetadataKeyTitle)
+                info.metadata = metadata
+                let item = GCKMediaQueueItemBuilder()
+                item.mediaInformation = info.build()
+                item.autoplay = true
+                item.startTime = 0
+                nextCast = (id,url)
+                let request = remote.queueInsert(item.build(),beforeItemWithID:kGCKMediaQueueInvalidItemID)
+                queueRequestID = Int(request.requestID)
+                request.delegate = self
+            } else if action == "clearNext", let id = body["id"] as? String, nextCast?.id == id {
+                nextCast = nil
+                queueRequestID = nil
             } else if action == "load" {
                 guard let raw = body["url"] as? String, let url = URL(string:raw), sameOrigin(url), (url.path.hasPrefix("/watch-media/") || url.path.hasPrefix("/watch-hls/")) else { return }
                 pendingLoad = body; pendingSince = Date()
@@ -243,11 +270,22 @@ struct FamilyWebView: UIViewRepresentable {
             request.autoplay = NSNumber(value:true)
             request.startTime = body["start"] as? Double ?? 0
             request.activeTrackIDs = (body["activeTracks"] as? [Int] ?? []).map { NSNumber(value:$0) }
+            let item = GCKMediaQueueItemBuilder()
+            item.mediaInformation = request.mediaInformation
+            item.autoplay = true
+            item.startTime = request.startTime
+            item.activeTrackIDs = request.activeTrackIDs
+            let queue = GCKMediaQueueDataBuilder(queueType:.generic)
+            queue.items = [item.build()]
+            queue.repeatMode = .off
+            request.queueData = queue.build()
             clearCastObservation()
             loadedID = body["id"] as? String; expectedContentURL = url; pendingLoad = nil
             observedCastClient = remote
             remote.add(self)
-            remote.loadMedia(with:request.build()).delegate = self
+            let load = remote.loadMedia(with:request.build())
+            loadRequestID = Int(load.requestID)
+            load.delegate = self
         }
         func clearCastObservation() {
             observedCastClient?.remove(self)
@@ -255,11 +293,26 @@ struct FamilyWebView: UIViewRepresentable {
             observedMediaSessionID = nil
             observedDuration = 0
             sentCastFinished = false
+            nextCast = nil; queueRequestID = nil; loadRequestID = nil
+        }
+        func queueEvent(_ id:String,_ state:String) {
+            guard let bytes = try? JSONSerialization.data(withJSONObject:["id":id,"state":state]),
+                  let json = String(data:bytes,encoding:.utf8) else { return }
+            webView?.evaluateJavaScript("window.nitecastQueueState?.(\(json))",completionHandler:nil)
         }
         func remoteMediaClient(_ client:GCKRemoteMediaClient,didUpdate mediaStatus:GCKMediaStatus?) {
-            guard let status = mediaStatus, client === observedCastClient,
-                  let id = loadedID, let expectedURL = expectedContentURL else { return }
+            guard let status = mediaStatus, client === observedCastClient else { return }
             let url = status.mediaInformation?.contentURL
+            if let next = nextCast, url == next.url {
+                if status.playerState == .idle, status.idleReason == .error {
+                    nextCast = nil; queueRequestID = nil; queueEvent(next.id,"failed")
+                } else if status.playerState == .playing {
+                    loadedID = next.id; expectedContentURL = next.url
+                    observedMediaSessionID = nil; observedDuration = 0; sentCastFinished = false
+                    nextCast = nil; queueRequestID = nil; queueEvent(next.id,"playing")
+                }
+            }
+            guard let id = loadedID, let expectedURL = expectedContentURL else { return }
             if status.playerState != .idle, url == expectedURL, status.mediaSessionID != 0 {
                 observedMediaSessionID = status.mediaSessionID
                 if let duration = status.mediaInformation?.streamDuration, duration.isFinite, duration > 0 {
@@ -268,7 +321,8 @@ struct FamilyWebView: UIViewRepresentable {
             }
             // Chromecast may remove the media URL from its terminal status.
             guard status.playerState == .idle, status.idleReason == .finished, !sentCastFinished,
-                  url == expectedURL || (url == nil && status.mediaSessionID == observedMediaSessionID) else { return }
+                  url == expectedURL || (url == nil && observedMediaSessionID != nil &&
+                    (status.mediaSessionID == observedMediaSessionID || status.mediaSessionID == 0)) else { return }
             sentCastFinished = true
             let data: [String:Any] = ["id":id,"casting":true,"finished":true,"duration":observedDuration]
             if let bytes = try? JSONSerialization.data(withJSONObject:data), let json = String(data:bytes,encoding:.utf8) {
@@ -315,7 +369,16 @@ struct FamilyWebView: UIViewRepresentable {
                 webView?.evaluateJavaScript("window.nitecastCastState(\(json))",completionHandler:nil)
             }
         }
+        func requestDidComplete(_ request:GCKRequest) {
+            if Int(request.requestID) == queueRequestID, let next = nextCast {
+                queueRequestID = nil; queueEvent(next.id,"queued")
+            }
+        }
         func request(_ request:GCKRequest,didFailWithError error:GCKError) {
+            if Int(request.requestID) == queueRequestID, let next = nextCast {
+                nextCast = nil; queueRequestID = nil; queueEvent(next.id,"failed"); return
+            }
+            guard Int(request.requestID) == loadRequestID else { notify(error.localizedDescription); return }
             notify(error.localizedDescription)
             webView?.evaluateJavaScript("window.nitecastCastError('The TV could not play this video. Retry playback or reconnect Cast.')",completionHandler:nil)
         }
